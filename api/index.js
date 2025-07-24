@@ -52,33 +52,34 @@ async function upsertSnapshot(data) {
  */
 export default async function handler(req, res) {
   try {
-    let page = 1
-    const allData = []
+    let page = 1;
+    const allData = [];
+    const TARGET = 1250;
 
-    // keep fetching until CoinGecko returns no coins
-    while (true) {
-      const pageData = await fetchPage(page)
-      if (!pageData.length) break
+    while (allData.length < TARGET) {
+      const pageData = await fetchPage(page);
+      if (!pageData.length) break;             // no more data
+      allData.push(...pageData);
 
-      allData.push(...pageData)
-      console.log(`Fetched page ${page} (${pageData.length} records)`)
-      
-      // if you prefer stopping at the top‑500 only:
-      // if (allData.length >= 500) break
+      console.log(
+        `Fetched page ${page} (${pageData.length} records). Total so far: ${allData.length}`
+      );
 
-      page++
+      page++;
     }
 
-    console.log(`Total coins fetched: ${allData.length}`)
+    // If you overshoot (e.g. last page pushed you past 1000), trim to exactly 1000
+    const sliced = allData.slice(0, TARGET);
 
-    // optional: clean data (if you added cleanCoinData)
-    // const cleaned = allData.map(cleanCoinData)
+    // Upsert only the first 1000 coins
+    await upsertSnapshot(sliced);
 
-    await upsertSnapshot(allData)
-    res.status(200).json({ message: 'All pages upserted', total: allData.length })
+    res
+      .status(200)
+      .json({ message: `Upserted ${sliced.length} records (max ${TARGET})` });
   } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: err.message })
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 }
 
