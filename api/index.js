@@ -52,6 +52,39 @@ async function upsertSnapshot(data) {
  */
 export default async function handler(req, res) {
   try {
+    let page = 1
+    const allData = []
+
+    // keep fetching until CoinGecko returns no coins
+    while (true) {
+      const pageData = await fetchPage(page)
+      if (!pageData.length) break
+
+      allData.push(...pageData)
+      console.log(`Fetched page ${page} (${pageData.length} records)`)
+      
+      // if you prefer stopping at the top‑500 only:
+      // if (allData.length >= 500) break
+
+      page++
+    }
+
+    console.log(`Total coins fetched: ${allData.length}`)
+
+    // optional: clean data (if you added cleanCoinData)
+    // const cleaned = allData.map(cleanCoinData)
+
+    await upsertSnapshot(allData)
+    res.status(200).json({ message: 'All pages upserted', total: allData.length })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: err.message })
+  }
+}
+
+/*
+export default async function handler(req, res) {
+  try {
     // You can loop pages if needed
     const page1 = await fetchPage(1);
     await upsertSnapshot(page1);
@@ -62,3 +95,4 @@ export default async function handler(req, res) {
     res.status(500).json({ error: err.message });
   }
 }
+*/
