@@ -1,99 +1,161 @@
-// index.js
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import { dirname, resolve } from 'path';
 
-dotenv.config();
+// Load environment variables from .env file
+dotenv.config({ path: resolve(dirname(fileURLToPath(import.meta.url)), '../.env') });
+
+// Validate required environment variables
+const { SUPABASE_URL, SUPABASE_SERVICE_KEY, SNAPSHOT_TABLE, SNAPSHOT_CONFLICT_KEY } = process.env;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.error('❌ Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in environment');
+  process.exit(1);
+}
 
 // Initialize Supabase client
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+  // optional: adjust timeout, schema, logging, etc.
+  global: { headers: { 'x-client-platform': 'node' } }
+});
 
 // Configuration
 const COINGECKO_API = process.env.COINGECKO_API_URL || 'https://api.coingecko.com/api/v3/coins/markets';
-const VS_CURRENCY = 'usd';
-const PER_PAGE = 250;
-const TABLE_NAME = process.env.SNAPSHOT_TABLE || 'snapshot';
-const CONFLICT_KEY = process.env.SNAPSHOT_CONFLICT_KEY || 'id';
+const VS_CURRENCY = process.env.VS_CURRENCY || 'usd';
+const PER_PAGE = parseInt(process.env.PER_PAGE, 10) || 250;
+const TARGET = parseInt(process.env.TARGET, 10) || 1250;
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE, 10) || 200;
+const TABLE_NAME = SNAPSHOT_TABLE || 'snapshot';
+const CONFLICT_KEY = SNAPSHOT_CONFLICT_KEY || 'id';
+
+// Utilities
+/**
+ * Deduplicate data by key
+ */
+function deduplicateByKey(data, key) {
+  const map = new Map();
+  for (const record of data) {
+    map.set(record[key], record);
+  }
+  return Array.from(map.values());
+}
 
 /**
- * Fetch a single page of CoinGecko market data
- * @param {number} page
+ * Find duplicate IDs in data
+ */
+function findDuplicateIds(data, key) {
+  const seen = new Set();
+  const dupes = new Set();
+  for (const record of data) {
+    const id = record[key];
+    if (seen.has(id)) dupes.add(id);
+    else seen.add(id);
+  }
+  return Array.from(dupes);
+}
+
+/**
+ * Chunk an array into smaller arrays
+ */
+function chunkArray(array, size) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * Fetch a single page from CoinGecko
  */
 async function fetchPage(page = 1) {
   const url = `${COINGECKO_API}?vs_currency=${VS_CURRENCY}&order=market_cap_desc&per_page=${PER_PAGE}&page=${page}`;
   const res = await fetch(url);
   if (!res.ok) {
-    throw new Error(`CoinGecko API error: ${res.status}`);
+    throw new Error(`CoinGecko API error: ${res.status} ${res.statusText}`);
   }
   return res.json();
 }
 
 /**
- * Upsert snapshot records into Supabase
- * @param {Array<Object>} data
+ * Upsert a batch of records into Supabase
  */
-async function upsertSnapshot(data) {
-  const { error } = await supabase
+async function upsertBatch(batch) {
+  const { data, error } = await supabase
     .from(TABLE_NAME)
-    .upsert(data, { onConflict: CONFLICT_KEY });
+    .upsert(batch, { onConflict: CONFLICT_KEY });
 
   if (error) {
-    console.error('Supabase upsert error:', error);
+    console.error('❌ Upsert batch error:', error);
     throw error;
   }
-  console.log(`Upserted ${data.length} records into ${TABLE_NAME}.`);
+  console.log(`✅ Batch upserted ${batch.length} records.`);
+  return data;
 }
 
 /**
- * Main handler (e.g., for Vercel serverless function)
+ * Main handler: fetch, dedupe, and upsert
  */
 export default async function handler(req, res) {
   try {
-    let page = 1;
+    console.log('🔄 Starting snapshot fetch...');
     const allData = [];
-    const TARGET = 1250;
+    let page = 1;
 
+    // Fetch until TARGET or no more data
     while (allData.length < TARGET) {
       const pageData = await fetchPage(page);
-      if (!pageData.length) break;             // no more data
+      if (!Array.isArray(pageData) || pageData.length === 0) break;
+
+      console.log(`Fetched page ${page}: ${pageData.length} records.`);
       allData.push(...pageData);
-
-      console.log(
-        `Fetched page ${page} (${pageData.length} records). Total so far: ${allData.length}`
-      );
-
       page++;
     }
 
-    // If you overshoot (e.g. last page pushed you past 1000), trim to exactly 1000
+    // Trim to TARGET
     const sliced = allData.slice(0, TARGET);
+    console.log(`Total records fetched (trimmed to ${TARGET}): ${sliced.length}`);
 
-    // Upsert only the first 1000 coins
-    await upsertSnapshot(sliced);
+    // Detect duplicates
+    const dupes = findDuplicateIds(sliced, CONFLICT_KEY);
+    if (dupes.length > 0) {
+      console.warn(`⚠️ Found ${dupes.length} duplicate IDs. Skipping these IDs:`);
+      console.warn(dupes);
+    }
 
-    res
-      .status(200)
-      .json({ message: `Upserted ${sliced.length} records (max ${TARGET})` });
+    // Deduplicate data
+    const deduplicated = deduplicateByKey(sliced, CONFLICT_KEY);
+    console.log(`Deduplicated records: removed ${sliced.length - deduplicated.length} duplicates.`);
+
+    // Chunk and upsert
+    const chunks = chunkArray(deduplicated, BATCH_SIZE);
+    console.log(`Uploading in ${chunks.length} batch(es) of up to ${BATCH_SIZE} records each.`);
+
+    for (const [i, batch] of chunks.entries()) {
+      console.log(`Upserting batch ${i + 1}/${chunks.length}...`);
+      await upsertBatch(batch);
+    }
+
+    console.log('🎉 All batches upserted successfully.');
+
+    // Send response
+    if (res) {
+      res.status(200).json({ message: 'Snapshot upsert complete', total: deduplicated.length });
+    }
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error('🚨 Handler error:', err);
+    if (res) {
+      res.status(500).json({ error: err.message });
+    }
   }
 }
 
-/*
-export default async function handler(req, res) {
-  try {
-    // You can loop pages if needed
-    const page1 = await fetchPage(1);
-    await upsertSnapshot(page1);
-
-    res.status(200).json({ message: 'Snapshot upserted successfully', count: page1.length });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
+// Local-run compatibility
+const currentModule = fileURLToPath(import.meta.url);
+if (process.argv[1] === currentModule) {
+  handler().catch(err => {
+    console.error('🚨 Local run error:', err);
+    process.exit(1);
+  });
 }
-*/
