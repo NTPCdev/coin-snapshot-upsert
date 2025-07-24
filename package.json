@@ -1,0 +1,20 @@
+{
+  "name": "coin-snapshot-upsert",
+  "version": "1.0.0",
+  "description": "Fetches CoinGecko market data and upserts it into Supabase",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev --listen 3000",
+    "start": "vercel dev",
+    "build": "echo \"No build step required\""
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.15.0",
+    "dotenv": "^16.0.0",
+    "node-fetch": "^3.4.0"
+  }
+}
